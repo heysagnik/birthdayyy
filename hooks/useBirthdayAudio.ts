@@ -12,7 +12,7 @@ type BirthdayAudioOptions = {
   onVolumeChange?: (volume: number) => void
   onMuteToggle?: (isMuted: boolean) => void
   onSongChange?: (songUrl: string) => void
-  onError?: (error: Event | string) => void
+  onError?: (error: Event | string | Error) => void // Allow Error type
 }
 
 /**
@@ -58,15 +58,43 @@ export const useBirthdayAudio = (options: BirthdayAudioOptions = {}) => {
     }
   }
 
-  const handleError = useCallback((error: Event | string, context: string) => {
-    const errorMessage = typeof error === 'string' ? error : (error.target as HTMLAudioElement)?.error?.message || 'Unknown audio error'
-    console.error(`Audio Error (${context}):`, errorMessage, error)
-    safeSetState<string | null>(setErrorState, errorMessage)
+  const handleError = useCallback((error: Event | string | Error, context: string) => {
+    let errorMessage = 'Unknown audio error';
+    let logErrorObject: any = error; // Keep original error for logging
+
+    if (typeof error === 'string') {
+      errorMessage = error;
+    } else if (error instanceof Error) {
+      // Handle DOMExceptions like NotAllowedError
+      errorMessage = error.message;
+      if (error.name === 'NotAllowedError' && context === 'autoplay') {
+        errorMessage = "Autoplay failed: User interaction required.";
+        console.warn(`Audio Warning (${context}): ${errorMessage}`); // Log as warning, not error
+        safeSetState<boolean>(setCanAutoplay, false); // Ensure autoplay flag is false
+        safeSetState<boolean>(setIsPlaying, false); // Ensure playing state is false
+      } else {
+         console.error(`Audio Error (${context}):`, errorMessage, logErrorObject);
+      }
+    } else if (error.target && (error.target as HTMLAudioElement).error) {
+      // Handle MediaError from HTMLAudioElement events
+      const mediaError = (error.target as HTMLAudioElement).error;
+      errorMessage = mediaError?.message || `MediaError code ${mediaError?.code}`;
+      console.error(`Audio Error (${context}):`, errorMessage, logErrorObject);
+    } else {
+       console.error(`Audio Error (${context}):`, errorMessage, logErrorObject);
+    }
+
+
+    // Only set general error state if it's not the specific autoplay warning
+    if (!(error instanceof Error && error.name === 'NotAllowedError' && context === 'autoplay')) {
+       safeSetState<string | null>(setErrorState, errorMessage);
+    }
+
     if (onError) {
-      onError(error)
+      onError(error) // Pass the original error object
     }
     safeSetState<boolean>(setIsLoading, false) // Ensure loading stops on error
-  }, [onError])
+  }, [onError]) // Removed safeSetState from dependencies as it's stable
 
   // --- Effects ---
 
@@ -153,13 +181,20 @@ export const useBirthdayAudio = (options: BirthdayAudioOptions = {}) => {
 
     // Attempt autoplay if enabled and not already playing
     if (autoPlay && !isPlaying && canAutoplay) {
-      audio.play().catch(error => {
+      // Set loading true before attempting play
+      safeSetState<boolean>(setIsLoading, true);
+      audio.play().then(() => {
+        // Success: 'play' event will set isLoading false
+      }).catch(error => {
         // Autoplay was likely prevented by the browser
         handleError(error, 'autoplay')
-        safeSetState<boolean>(setCanAutoplay, false) // Don't attempt autoplay again automatically
-        safeSetState<boolean>(setIsPlaying, false) // Ensure state reflects reality
+        // handleError now handles setting canAutoplay and isPlaying for NotAllowedError
       })
+    } else if (!autoPlay || !canAutoplay) {
+        // If not attempting autoplay, ensure loading is false initially
+        safeSetState<boolean>(setIsLoading, false);
     }
+
 
     // Cleanup function
     return () => {
@@ -187,23 +222,25 @@ export const useBirthdayAudio = (options: BirthdayAudioOptions = {}) => {
     }
     // Dependencies: Re-run effect if song, loop, or autoplay intent changes.
     // Avoid adding `volume`, `isMuted`, `isPlaying` as they are managed internally or via controls.
-  }, [currentSong, loop, autoPlay, canAutoplay, handleError, onPlay, onPause, onEnded, onVolumeChange, onMuteToggle])
+  }, [currentSong, loop, autoPlay, canAutoplay, handleError, onPlay, onPause, onEnded, onVolumeChange, onMuteToggle]) // Removed volume, isMuted, isPlaying
 
   // --- Control Functions ---
 
   const play = useCallback(() => {
     if (audioRef.current) {
       // Reset canAutoplay flag if user manually initiates play
-      setCanAutoplay(true)
+      if (!canAutoplay) safeSetState<boolean>(setCanAutoplay, true);
+      safeSetState<boolean>(setIsLoading, true); // Show loading while trying to play
       audioRef.current.play()
         .then(() => {
           // State update handled by 'play' event listener
+          // 'play' event will set isLoading to false
         })
         .catch(error => {
           handleError(error, 'play command')
         })
     }
-  }, [handleError])
+  }, [handleError, canAutoplay]) // Added canAutoplay dependency
 
   const pause = useCallback(() => {
     if (audioRef.current && !audioRef.current.paused) {
@@ -235,7 +272,7 @@ export const useBirthdayAudio = (options: BirthdayAudioOptions = {}) => {
       audioRef.current.muted = !audioRef.current.muted
       // State update handled by 'volumechange' event listener
     }
-  }, []) // <-- Added closing brace and comma
+  }, []) // Corrected missing closing brace and comma in original code
 
   const changeSong = useCallback((songUrl: string) => {
     if (audioRef.current && songUrl !== currentSong) {
@@ -246,16 +283,33 @@ export const useBirthdayAudio = (options: BirthdayAudioOptions = {}) => {
       if (onSongChange) {
         onSongChange(songUrl)
       }
+      // Reset time and duration for the new song
+      safeSetState<number>(setCurrentTime, 0);
+      safeSetState<number>(setDuration, 0);
     }
-  }, [currentSong, onSongChange, safeSetState]) // Added dependencies
+  }, [currentSong, onSongChange]) // Removed safeSetState from dependencies
 
   const seekTo = useCallback((timeInSeconds: number) => {
-    if (audioRef.current && Number.isFinite(duration)) {
+    if (audioRef.current && Number.isFinite(duration) && duration > 0) { // Check duration > 0
       const clampedTime = Math.max(0, Math.min(timeInSeconds, duration))
+      // Set loading true before seeking, false on 'seeked' or 'canplay'
+      safeSetState<boolean>(setIsLoading, true);
+      const handleSeeked = () => {
+        safeSetState<boolean>(setIsLoading, false);
+        audioRef.current?.removeEventListener('seeked', handleSeeked);
+        audioRef.current?.removeEventListener('canplay', handleSeeked); // Also handle canplay
+      }
+      audioRef.current.addEventListener('seeked', handleSeeked);
+      audioRef.current.addEventListener('canplay', handleSeeked); // If seek causes buffering
+
       audioRef.current.currentTime = clampedTime
       safeSetState(setCurrentTime, clampedTime) // Update state immediately for responsiveness
+    } else if (audioRef.current) {
+        // If duration is not yet known, just set the time. Browser will handle it.
+        audioRef.current.currentTime = Math.max(0, timeInSeconds);
+        safeSetState(setCurrentTime, Math.max(0, timeInSeconds));
     }
-  }, [duration])
+  }, [duration]) // Removed safeSetState
 
   // --- Utility Functions ---
 
@@ -263,8 +317,9 @@ export const useBirthdayAudio = (options: BirthdayAudioOptions = {}) => {
     if (!Number.isFinite(timeInSeconds) || timeInSeconds < 0) {
       return "0:00"
     }
-    const minutes = Math.floor(timeInSeconds / 60)
-    const seconds = Math.floor(timeInSeconds % 60)
+    const totalSeconds = Math.floor(timeInSeconds);
+    const minutes = Math.floor(totalSeconds / 60)
+    const seconds = totalSeconds % 60
     return `${minutes}:${seconds < 10 ? '0' : ''}${seconds}`
   }, [])
 
@@ -285,7 +340,7 @@ export const useBirthdayAudio = (options: BirthdayAudioOptions = {}) => {
     duration,
     /** Current playback time in seconds. */
     currentTime,
-    /** Indicates if the audio is currently loading or stalled. */
+    /** Indicates if the audio is currently loading, buffering, or stalled. */
     isLoading,
     /** A string containing the last error message, or null if no error. */
     error: errorState,
